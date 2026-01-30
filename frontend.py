@@ -11,13 +11,12 @@ from textual.binding import Binding
 from backend import (
     DBConfig,
     create_engine_safe,
-    full_database_copy,
+    full_migration,
     incremental_sync,
     table_copy_delete_and_recreate,
     table_copy_delta_only,
     fetch_tables,
     test_connection,
-    get_row_count,
 )
 
 # ---------------- SCREENS ----------------
@@ -241,6 +240,21 @@ class TableSelectionScreen(Screen):
                 classes="button-row"
             ),
             Static(""),
+            Static("Copy Mode:", classes="subtitle"),
+            Select(
+                [
+                    ("Delete & Recreate (Full refresh)", "delete_recreate"),
+                    ("Delta Only (Add new rows)", "delta_only"),
+                ],
+                id="copy_mode",
+                value="delete_recreate"
+            ),
+            Static(""),
+            Horizontal(
+                Checkbox("Exclude auto-generated columns (e.g., serial IDs)", id="exclude_auto"),
+                classes="checkbox-row"
+            ),
+            Static(""),
             Horizontal(
                 Button("← Back", id="back", variant="default"),
                 Button("Next →", id="next", variant="primary"),
@@ -252,43 +266,21 @@ class TableSelectionScreen(Screen):
         yield Footer()
     
     def on_mount(self):
-        self.selected_tables = set()
         self.load_tables()
     
     def load_tables(self):
         try:
-            engine = create_engine_safe(self.app.src_cfg)
-            tables = fetch_tables(engine, "public")
+            src_engine = create_engine_safe(self.app.src_cfg)
+            tables = fetch_tables(src_engine, "public")
             
-            table = self.query_one("#tables", DataTable)
-            table.add_columns("Select", "Table Name", "Row Count")
+            table_widget = self.query_one("#tables", DataTable)
+            table_widget.add_columns("Selected", "Table Name")
             
-            for tbl in tables:
-                try:
-                    count = get_row_count(engine, tbl)
-                except:
-                    count = "N/A"
-                table.add_row("☐", tbl, str(count))
+            for table in tables:
+                table_widget.add_row("☐", table)
             
-            self.query_one("#status", Static).update(f"Found {len(tables)} tables")
         except Exception as e:
-            self.query_one("#status", Static).update(f"❌ Error: {str(e)}")
-    
-    def on_data_table_row_selected(self, event: DataTable.RowSelected):
-        table = self.query_one("#tables", DataTable)
-        row_key = event.row_key
-        
-        # Get table name from row
-        row_data = table.get_row(row_key)
-        table_name = row_data[1]
-        
-        # Toggle selection
-        if table_name in self.selected_tables:
-            self.selected_tables.remove(table_name)
-            table.update_cell(row_key, "Select", "☐")
-        else:
-            self.selected_tables.add(table_name)
-            table.update_cell(row_key, "Select", "☑")
+            self.query_one("#status", Static).update(f"❌ Error loading tables: {str(e)}")
     
     def action_back(self):
         self.app.pop_screen()
@@ -297,80 +289,47 @@ class TableSelectionScreen(Screen):
         if event.button.id == "back":
             self.app.pop_screen()
         elif event.button.id == "select_all":
-            table = self.query_one("#tables", DataTable)
-            for row_key in table.rows:
-                row_data = table.get_row(row_key)
-                table_name = row_data[1]
-                self.selected_tables.add(table_name)
-                table.update_cell(row_key, "Select", "☑")
+            self.select_all_tables(True)
         elif event.button.id == "deselect_all":
-            table = self.query_one("#tables", DataTable)
-            for row_key in table.rows:
-                table.update_cell(row_key, "Select", "☐")
-            self.selected_tables.clear()
+            self.select_all_tables(False)
         elif event.button.id == "next":
-            if not self.selected_tables:
-                self.query_one("#status", Static).update("⚠ Please select at least one table")
-                return
-            
-            self.app.selected_tables = list(self.selected_tables)
-            self.app.push_screen(TableOptionsScreen())
-
-
-class TableOptionsScreen(Screen):
-    """Screen for configuring table copy options"""
+            self.save_and_next()
     
-    BINDINGS = [
-        Binding("escape", "back", "Back"),
-    ]
+    def on_data_table_row_selected(self, event):
+        """Toggle selection when row is clicked"""
+        table_widget = self.query_one("#tables", DataTable)
+        row_key = event.row_key
+        current_value = table_widget.get_cell(row_key, "Selected")
+        new_value = "☑" if current_value == "☐" else "☐"
+        table_widget.update_cell(row_key, "Selected", new_value)
     
-    def compose(self) -> ComposeResult:
-        yield Header()
-        yield Container(
-            Static("⚙️ CONFIGURE TABLE COPY OPTIONS", classes="section-title"),
-            Static(""),
-            Static(f"Selected {len(self.app.selected_tables)} table(s):", classes="subtitle"),
-            Static(", ".join(self.app.selected_tables[:5]) + ("..." if len(self.app.selected_tables) > 5 else "")),
-            Static(""),
-            Label("Copy Mode:"),
-            Select(
-                [
-                    ("Delete & Recreate", "delete_recreate"),
-                    ("Copy Delta Only (New Rows)", "delta_only"),
-                ],
-                id="copy_mode",
-                value="delete_recreate"
-            ),
-            Static(""),
-            Horizontal(
-                Checkbox("Exclude auto-generated fields", id="exclude_auto", value=False),
-                classes="checkbox-row"
-            ),
-            Static(""),
-            Static("Auto-generated fields include:", classes="info"),
-            Static("  • Serial columns (SERIAL, BIGSERIAL)"),
-            Static("  • Columns with nextval() defaults"),
-            Static("  • UUID generation defaults"),
-            Static(""),
-            Horizontal(
-                Button("← Back", id="back", variant="default"),
-                Button("Next →", id="next", variant="primary"),
-                classes="button-row"
-            ),
-            classes="form-container"
-        )
-        yield Footer()
+    def select_all_tables(self, select: bool):
+        table_widget = self.query_one("#tables", DataTable)
+        value = "☑" if select else "☐"
+        
+        for row_key in table_widget.rows:
+            table_widget.update_cell(row_key, "Selected", value)
     
-    def action_back(self):
-        self.app.pop_screen()
-    
-    def on_button_pressed(self, event: Button.Pressed):
-        if event.button.id == "back":
-            self.app.pop_screen()
-        elif event.button.id == "next":
-            self.app.copy_mode = self.query_one("#copy_mode", Select).value
-            self.app.exclude_auto = self.query_one("#exclude_auto", Checkbox).value
-            self.app.push_screen(ConfirmScreen())
+    def save_and_next(self):
+        # Get selected tables
+        table_widget = self.query_one("#tables", DataTable)
+        selected = []
+        
+        for row_key in table_widget.rows:
+            if table_widget.get_cell(row_key, "Selected") == "☑":
+                table_name = table_widget.get_cell(row_key, "Table Name")
+                selected.append(table_name)
+        
+        if not selected:
+            self.query_one("#status", Static).update("❌ Please select at least one table")
+            return
+        
+        # Save selections
+        self.app.selected_tables = selected
+        self.app.copy_mode = self.query_one("#copy_mode", Select).value
+        self.app.exclude_auto = self.query_one("#exclude_auto", Checkbox).value
+        
+        self.app.push_screen(ConfirmScreen())
 
 
 class ConfirmScreen(Screen):
@@ -470,7 +429,7 @@ class ProgressScreen(Screen):
             
             if self.app.mode == "full":
                 log_progress("Starting full database copy...")
-                full_database_copy(src_engine, dst_engine, log_progress)
+                full_migration(src_engine, dst_engine, exclude_auto_generated=False, progress_callback=log_progress)
                 
             elif self.app.mode == "delta":
                 log_progress("Starting incremental sync...")
@@ -505,6 +464,8 @@ class ProgressScreen(Screen):
             
         except Exception as e:
             log_progress(f"\n❌ ERROR: {str(e)}")
+            import traceback
+            log_progress(traceback.format_exc())
             status.update("❌ Migration failed!")
     
     def on_button_pressed(self, event: Button.Pressed):

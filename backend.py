@@ -48,7 +48,8 @@ def fetch_columns(engine: Engine, schema: str, table: str) -> List[Dict]:
         column_default,
         character_maximum_length,
         numeric_precision,
-        numeric_scale
+        numeric_scale,
+        udt_name
     FROM information_schema.columns
     WHERE table_schema=:schema AND table_name=:table
     ORDER BY ordinal_position
@@ -58,6 +59,44 @@ def fetch_columns(engine: Engine, schema: str, table: str) -> List[Dict]:
             dict(r._mapping)
             for r in conn.execute(text(sql), {"schema": schema, "table": table})
         ]
+
+
+def fetch_enum_types(engine: Engine) -> Dict[str, List[str]]:
+    """Fetch all ENUM types and their values from the database"""
+    sql = """
+    SELECT 
+        t.typname as enum_name,
+        array_agg(e.enumlabel ORDER BY e.enumsortorder) as enum_values
+    FROM pg_type t
+    JOIN pg_enum e ON t.oid = e.enumtypid
+    JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+    WHERE n.nspname = 'public'
+    GROUP BY t.typname
+    """
+    with engine.connect() as conn:
+        result = conn.execute(text(sql))
+        return {row[0]: row[1] for row in result}
+
+
+def ensure_enum_types(src: Engine, dst: Engine):
+    """Create ENUM types in destination database if they don't exist"""
+    enum_types = fetch_enum_types(src)
+    
+    with dst.begin() as conn:
+        for enum_name, enum_values in enum_types.items():
+            # Check if enum already exists
+            check_sql = """
+            SELECT 1 FROM pg_type t
+            JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+            WHERE t.typname = :enum_name AND n.nspname = 'public'
+            """
+            exists = conn.execute(text(check_sql), {"enum_name": enum_name}).fetchone()
+            
+            if not exists:
+                # Create the ENUM type
+                values_str = ", ".join([f"'{val}'" for val in enum_values])
+                create_enum_sql = f"CREATE TYPE public.{enum_name} AS ENUM ({values_str})"
+                conn.execute(text(create_enum_sql))
 
 
 def fetch_primary_key(engine: Engine, schema: str, table: str) -> Optional[str]:
@@ -143,7 +182,7 @@ def ensure_migrated_schema(engine: Engine):
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS migrated"))
 
 
-def recreate_table_schema(
+def create_table_schema_if_not_exists(
     src: Engine, 
     dst: Engine, 
     table: str, 
@@ -151,11 +190,15 @@ def recreate_table_schema(
     progress_callback: Optional[Callable] = None
 ) -> List[str]:
     """
-    Recreate table schema in destination database under 'migrated' schema
+    Create table schema in destination ONLY if it doesn't exist (for incremental sync)
+    Does NOT drop existing tables
     Returns list of column names to copy
     """
     if progress_callback:
         progress_callback(f"Creating schema for table: {table}")
+    
+    # Ensure ENUM types exist in destination
+    ensure_enum_types(src, dst)
     
     cols = fetch_columns(src, "public", table)
     pk = fetch_primary_key(src, "public", table)
@@ -173,9 +216,13 @@ def recreate_table_schema(
     for c in cols_to_create:
         col_name = c["column_name"]
         data_type = c["data_type"]
+        udt_name = c.get("udt_name", "")
         
+        # Handle USER-DEFINED types (ENUMs)
+        if data_type.upper() == "USER-DEFINED":
+            data_type = f"public.{udt_name}"
         # Handle character types with length
-        if "character" in data_type and c.get("character_maximum_length"):
+        elif "character" in data_type and c.get("character_maximum_length"):
             data_type = f"{data_type}({c['character_maximum_length']})"
         # Handle numeric types with precision
         elif "numeric" in data_type and c.get("numeric_precision"):
@@ -202,8 +249,6 @@ def recreate_table_schema(
                 # Check if default uses a sequence
                 if "nextval" in default_val.lower():
                     # Extract sequence name and create it in migrated schema
-                    # Example: nextval('attachments_id_seq'::regclass)
-                    import re
                     seq_match = re.search(r"nextval\('([^']+)'", default_val)
                     if seq_match:
                         seq_name = seq_match.group(1)
@@ -222,80 +267,177 @@ def recreate_table_schema(
     if pk and (not exclude_auto_generated or pk in [c["column_name"] for c in cols_to_create]):
         ddl_cols.append(f'PRIMARY KEY ("{pk}")')
     
-    # Build complete DDL with sequences
-    ddl_parts = []
+    # Build CREATE TABLE statement
+    ddl = ";\n    ".join(sequences_to_create + [
+        f'CREATE TABLE IF NOT EXISTS migrated."{table}" (\n        '
+        + ", ".join(ddl_cols)
+        + "\n    )"
+    ]) + ";"
     
-    # Add sequence creation statements
-    for seq_ddl in sequences_to_create:
-        ddl_parts.append(seq_ddl + ";")
-    
-    # Add table creation
-    ddl_parts.append(f"""
-    DROP TABLE IF EXISTS migrated."{table}" CASCADE;
-    
-    CREATE TABLE migrated."{table}" (
-        {", ".join(ddl_cols)}
-    );
-    """)
-    
-    ddl = "\n".join(ddl_parts)
-    
+    # Execute DDL
     with dst.begin() as conn:
         conn.execute(text(ddl))
     
+    # Return list of columns to copy
+    return [c["column_name"] for c in cols_to_create]
+
+
+def recreate_table_schema(
+    src: Engine,
+    dst: Engine,
+    table: str,
+    exclude_auto_generated: bool = False,
+    progress_callback: Optional[Callable] = None
+) -> List[str]:
+    """
+    Recreate table schema in destination (drops existing table first)
+    Returns list of column names to copy
+    """
+    if progress_callback:
+        progress_callback(f"Recreating schema for table: {table}")
+    
+    # Ensure ENUM types exist in destination
+    ensure_enum_types(src, dst)
+    
+    cols = fetch_columns(src, "public", table)
+    pk = fetch_primary_key(src, "public", table)
+    
+    # Filter out auto-generated columns if requested
+    if exclude_auto_generated:
+        cols_to_create = [c for c in cols if not is_auto_generated_column(c)]
+    else:
+        cols_to_create = cols
+    
+    # Build column definitions
+    ddl_cols = []
+    sequences_to_create = []
+    
+    for c in cols_to_create:
+        col_name = c["column_name"]
+        data_type = c["data_type"]
+        udt_name = c.get("udt_name", "")
+        
+        # Handle USER-DEFINED types (ENUMs)
+        if data_type.upper() == "USER-DEFINED":
+            data_type = f"public.{udt_name}"
+        # Handle character types with length
+        elif "character" in data_type and c.get("character_maximum_length"):
+            data_type = f"{data_type}({c['character_maximum_length']})"
+        # Handle numeric types with precision
+        elif "numeric" in data_type and c.get("numeric_precision"):
+            if c.get("numeric_scale"):
+                data_type = f"{data_type}({c['numeric_precision']},{c['numeric_scale']})"
+            else:
+                data_type = f"{data_type}({c['numeric_precision']})"
+        
+        line = f'"{col_name}" {data_type}'
+        
+        # Add NOT NULL constraint (skip for auto-generated PKs)
+        if c["is_nullable"] == "NO":
+            if not (exclude_auto_generated and col_name == pk):
+                line += " NOT NULL"
+        
+        # Handle DEFAULT values
+        if c["column_default"]:
+            if exclude_auto_generated and is_auto_generated_column(c):
+                # Skip auto-generated defaults when excluded
+                pass
+            else:
+                default_val = c["column_default"]
+                
+                # Check if default uses a sequence
+                if "nextval" in default_val.lower():
+                    # Extract sequence name and create it in migrated schema
+                    seq_match = re.search(r"nextval\('([^']+)'", default_val)
+                    if seq_match:
+                        seq_name = seq_match.group(1)
+                        # Create sequence in migrated schema
+                        sequences_to_create.append(f'CREATE SEQUENCE IF NOT EXISTS migrated."{seq_name}"')
+                        # Update default to use migrated schema sequence
+                        default_val = default_val.replace(f"'{seq_name}'", f"'migrated.{seq_name}'")
+                    line += f" DEFAULT {default_val}"
+                else:
+                    # Non-sequence default
+                    line += f" DEFAULT {default_val}"
+        
+        ddl_cols.append(line)
+    
+    # Add primary key constraint if exists and not excluded
+    if pk and (not exclude_auto_generated or pk in [c["column_name"] for c in cols_to_create]):
+        ddl_cols.append(f'PRIMARY KEY ("{pk}")')
+    
+    # Build DROP and CREATE TABLE statements
+    drop_ddl = f'DROP TABLE IF EXISTS migrated."{table}" CASCADE'
+    create_ddl = ";\n    ".join(sequences_to_create + [
+        f'CREATE TABLE migrated."{table}" (\n        '
+        + ", ".join(ddl_cols)
+        + "\n    )"
+    ]) + ";"
+    
+    # Execute DDL
+    with dst.begin() as conn:
+        conn.execute(text(drop_ddl))
+        conn.execute(text(create_ddl))
+    
+    # Return list of columns to copy
     return [c["column_name"] for c in cols_to_create]
 
 
 # ---------------- DATA OPERATIONS ---------------- #
 
 def fetch_all_rows(engine: Engine, table: str, columns: List[str]) -> List[Dict]:
-    """Fetch all rows from a table"""
-    col_list = ", ".join(f'"{c}"' for c in columns)
-    sql = f'SELECT {col_list} FROM public."{table}"'
+    """Fetch all rows from source table"""
+    cols_str = ", ".join([f'"{c}"' for c in columns])
+    sql = f'SELECT {cols_str} FROM public."{table}"'
     with engine.connect() as conn:
         return [dict(r._mapping) for r in conn.execute(text(sql))]
 
 
-def fetch_existing_pks(engine: Engine, table: str, pk: str) -> set:
-    """Fetch existing primary keys from destination table"""
-    sql = f'SELECT "{pk}" FROM migrated."{table}"'
+def fetch_existing_pks(engine: Engine, table: str, pk_col: str) -> set:
+    """Fetch all existing primary keys from destination table"""
     try:
+        sql = f'SELECT "{pk_col}" FROM migrated."{table}"'
         with engine.connect() as conn:
-            return {r[0] for r in conn.execute(text(sql))}
+            result = conn.execute(text(sql))
+            return {row[0] for row in result}
     except:
         return set()
 
 
-def prepare_row(row: Dict, columns_meta: List[Dict]) -> Dict:
-    """Fill NOT NULL columns with safe defaults if None and handle special types"""
-    fixed = row.copy()
-    
-    for c in columns_meta:
-        name = c["column_name"]
-        if name not in fixed:
-            continue
+def prepare_row(row: Dict, cols_meta: List[Dict]) -> Dict:
+    """Prepare row for insertion by handling special types"""
+    prepared = {}
+    for col in cols_meta:
+        col_name = col["column_name"]
+        value = row.get(col_name)
         
-        data_type = c["data_type"].lower()
-        value = fixed.get(name)
-        
-        # Handle JSON/JSONB types - convert dict/list to JSON string
-        if data_type in ("json", "jsonb"):
-            if value is not None and isinstance(value, (dict, list)):
-                fixed[name] = json.dumps(value)
-            elif value is None and c["is_nullable"] == "NO":
-                fixed[name] = "{}"
-        # Handle NULL values for NOT NULL columns
-        elif c["is_nullable"] == "NO" and value is None:
-            if "timestamp" in data_type or "date" in data_type:
-                fixed[name] = datetime.utcnow()
-            elif "character" in data_type or "text" in data_type:
-                fixed[name] = ""
-            elif "boolean" in data_type:
-                fixed[name] = False
+        if value is None:
+            prepared[col_name] = None
+        else:
+            data_type = col["data_type"].lower()
+            
+            # Handle JSON/JSONB
+            if data_type in ("json", "jsonb"):
+                if isinstance(value, (dict, list)):
+                    prepared[col_name] = json.dumps(value)
+                else:
+                    prepared[col_name] = value
+            # Handle arrays
+            elif data_type == "array":
+                if isinstance(value, list):
+                    prepared[col_name] = value
+                else:
+                    prepared[col_name] = value
+            # Handle timestamps
+            elif "timestamp" in data_type or "date" in data_type:
+                if isinstance(value, datetime):
+                    prepared[col_name] = value.isoformat()
+                else:
+                    prepared[col_name] = value
             else:
-                fixed[name] = 0
+                prepared[col_name] = value
     
-    return fixed
+    return prepared
 
 
 def insert_rows(
@@ -308,74 +450,58 @@ def insert_rows(
     if not rows:
         return 0
     
-    cols = rows[0].keys()
-    col_list = ", ".join(f'"{c}"' for c in cols)
-    placeholders = ", ".join(f":{c}" for c in cols)
+    # Get column names from first row
+    columns = list(rows[0].keys())
+    cols_str = ", ".join([f'"{c}"' for c in columns])
+    placeholders = ", ".join([f":{c}" for c in columns])
     
-    sql = text(f'''
-        INSERT INTO migrated."{table}" ({col_list})
-        VALUES ({placeholders})
-    ''')
+    sql = f'INSERT INTO migrated."{table}" ({cols_str}) VALUES ({placeholders})'
     
-    inserted = 0
-    batch_size = 100
+    batch_size = 1000
+    total_inserted = 0
     
     with engine.begin() as conn:
-        for i, r in enumerate(rows):
-            conn.execute(sql, r)
-            inserted += 1
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            conn.execute(text(sql), batch)
+            total_inserted += len(batch)
             
-            if progress_callback and (i + 1) % batch_size == 0:
-                progress_callback(f"Inserted {inserted}/{len(rows)} rows")
+            if progress_callback and len(rows) > batch_size:
+                progress_callback(f"  Inserted {total_inserted}/{len(rows)} rows...")
     
-    return inserted
-
-
-def delete_all_rows(engine: Engine, table: str, progress_callback: Optional[Callable] = None):
-    """Delete all rows from a table"""
-    if progress_callback:
-        progress_callback(f"Deleting all rows from migrated.{table}")
-    
-    sql = f'DELETE FROM migrated."{table}"'
-    with engine.begin() as conn:
-        conn.execute(text(sql))
-
-
-def get_row_count(engine: Engine, table: str, schema: str = "public") -> int:
-    """Get row count for a table"""
-    sql = f'SELECT COUNT(*) FROM {schema}."{table}"'
-    with engine.connect() as conn:
-        return conn.execute(text(sql)).scalar()
+    return total_inserted
 
 
 # ---------------- MIGRATION MODES ---------------- #
 
-def full_database_copy(
+def full_migration(
     src: Engine, 
-    dst: Engine,
+    dst: Engine, 
+    exclude_auto_generated: bool = False,
     progress_callback: Optional[Callable] = None
 ):
     """
-    Mode 1: Complete database copy
-    Copies all tables and data from source to destination.migrated schema
+    Mode 1: Full migration (clean slate)
+    Drops and recreates all tables with fresh data
     """
     if progress_callback:
-        progress_callback("Starting full database copy...")
+        progress_callback("Starting full migration (clean slate)...")
     
     ensure_migrated_schema(dst)
     tables = fetch_tables(src, "public")
     
     total_tables = len(tables)
+    total_rows = 0
     
     for idx, table in enumerate(tables, 1):
         if progress_callback:
             progress_callback(f"[{idx}/{total_tables}] Processing table: {table}")
         
-        # Create table schema
-        columns = recreate_table_schema(src, dst, table, exclude_auto_generated=False)
+        # Recreate table schema
+        columns = recreate_table_schema(src, dst, table, exclude_auto_generated, progress_callback)
         
         # Get column metadata
-        cols_meta = fetch_columns(src, "public", table)
+        cols_meta = [c for c in fetch_columns(src, "public", table) if c["column_name"] in columns]
         
         # Fetch all rows
         src_rows = fetch_all_rows(src, table, columns)
@@ -383,15 +509,21 @@ def full_database_copy(
         if progress_callback:
             progress_callback(f"[{idx}/{total_tables}] Copying {len(src_rows)} rows...")
         
-        # Prepare and insert rows
+        # Prepare and insert
         prepared_rows = [prepare_row(r, cols_meta) for r in src_rows]
-        inserted = insert_rows(dst, table, prepared_rows)
+        inserted = insert_rows(dst, table, prepared_rows, progress_callback)
+        total_rows += inserted
         
         if progress_callback:
             progress_callback(f"[{idx}/{total_tables}] ✓ {table}: {inserted} rows copied")
     
     if progress_callback:
-        progress_callback(f"✅ Full database copy completed! {total_tables} tables processed.")
+        progress_callback(f"\n{'='*60}")
+        progress_callback(f"✅ Full migration completed!")
+        progress_callback(f"{'='*60}")
+        progress_callback(f"Total tables: {total_tables}")
+        progress_callback(f"Total rows copied: {total_rows}")
+        progress_callback(f"{'='*60}")
 
 
 def incremental_sync(
@@ -402,6 +534,7 @@ def incremental_sync(
     """
     Mode 2: Incremental sync (delta copy)
     Only copies new rows that don't exist in destination based on primary key
+    Does NOT drop existing tables - preserves existing data
     """
     if progress_callback:
         progress_callback("Starting incremental sync...")
@@ -410,6 +543,13 @@ def incremental_sync(
     tables = fetch_tables(src, "public")
     
     total_tables = len(tables)
+    stats = {
+        "tables_created": 0,
+        "tables_synced": 0,
+        "tables_skipped": 0,
+        "tables_up_to_date": 0,
+        "total_rows_synced": 0
+    }
     
     for idx, table in enumerate(tables, 1):
         if progress_callback:
@@ -418,6 +558,7 @@ def incremental_sync(
         # Get primary key
         pk = fetch_primary_key(src, "public", table)
         if not pk:
+            stats["tables_skipped"] += 1
             if progress_callback:
                 progress_callback(f"[{idx}/{total_tables}] ⚠ Skipped {table} (no primary key)")
             continue
@@ -431,13 +572,17 @@ def incremental_sync(
         except:
             table_exists = False
         
-        # Create table schema if it doesn't exist
+        # Create table schema if it doesn't exist (without dropping)
         if not table_exists:
+            stats["tables_created"] += 1
             if progress_callback:
                 progress_callback(f"[{idx}/{total_tables}] Creating table schema...")
-            columns = recreate_table_schema(src, dst, table, exclude_auto_generated=False)
+            columns = create_table_schema_if_not_exists(src, dst, table, exclude_auto_generated=False)
         else:
             # Table exists, just get columns
+            stats["tables_synced"] += 1
+            if progress_callback:
+                progress_callback(f"[{idx}/{total_tables}] Table exists, syncing new rows...")
             columns = [c["column_name"] for c in fetch_columns(src, "public", table)]
         
         cols_meta = fetch_columns(src, "public", table)
@@ -456,16 +601,30 @@ def incremental_sync(
         ]
         
         if progress_callback:
-            progress_callback(f"[{idx}/{total_tables}] Found {len(new_rows)} new rows...")
+            progress_callback(f"[{idx}/{total_tables}] Found {len(new_rows)} new rows out of {len(src_rows)} total...")
         
         # Insert new rows
-        inserted = insert_rows(dst, table, new_rows)
-        
-        if progress_callback:
-            progress_callback(f"[{idx}/{total_tables}] ✓ {table}: {inserted} new rows synced")
+        if new_rows:
+            inserted = insert_rows(dst, table, new_rows)
+            stats["total_rows_synced"] += inserted
+            if progress_callback:
+                progress_callback(f"[{idx}/{total_tables}] ✓ {table}: {inserted} new rows synced")
+        else:
+            stats["tables_up_to_date"] += 1
+            if progress_callback:
+                progress_callback(f"[{idx}/{total_tables}] ✓ {table}: No new rows to sync (up to date)")
     
     if progress_callback:
-        progress_callback(f"✅ Incremental sync completed! {total_tables} tables processed.")
+        progress_callback(f"\n{'='*60}")
+        progress_callback(f"✅ Incremental sync completed!")
+        progress_callback(f"{'='*60}")
+        progress_callback(f"Total tables processed: {total_tables}")
+        progress_callback(f"  • New tables created: {stats['tables_created']}")
+        progress_callback(f"  • Existing tables synced: {stats['tables_synced']}")
+        progress_callback(f"  • Tables up to date: {stats['tables_up_to_date']}")
+        progress_callback(f"  • Tables skipped (no PK): {stats['tables_skipped']}")
+        progress_callback(f"  • Total new rows synced: {stats['total_rows_synced']}")
+        progress_callback(f"{'='*60}")
 
 
 def table_copy_delete_and_recreate(
@@ -514,6 +673,7 @@ def table_copy_delta_only(
 ):
     """
     Mode 3b: Copy only delta (new) items based on primary key
+    Does NOT drop existing table - only adds new rows
     """
     if progress_callback:
         progress_callback(f"Delta copy mode for table: {table}")
@@ -525,11 +685,28 @@ def table_copy_delta_only(
     if not pk:
         raise ValueError(f"Table {table} has no primary key - cannot perform delta copy")
     
-    # Ensure table exists in destination
+    # Check if table exists
+    table_exists = False
     try:
-        columns = recreate_table_schema(src, dst, table, exclude_auto_generated)
+        with dst.connect() as conn:
+            conn.execute(text(f'SELECT 1 FROM migrated."{table}" LIMIT 1'))
+        table_exists = True
     except:
+        table_exists = False
+    
+    # Create table if it doesn't exist (without dropping)
+    if not table_exists:
+        if progress_callback:
+            progress_callback(f"Table doesn't exist, creating schema...")
+        columns = create_table_schema_if_not_exists(src, dst, table, exclude_auto_generated)
+    else:
+        if progress_callback:
+            progress_callback(f"Table exists, finding new rows...")
         columns = [c["column_name"] for c in fetch_columns(src, "public", table)]
+        if exclude_auto_generated:
+            # Filter out auto-generated columns
+            all_cols = fetch_columns(src, "public", table)
+            columns = [c["column_name"] for c in all_cols if not is_auto_generated_column(c)]
     
     # Get column metadata
     cols_meta = [c for c in fetch_columns(src, "public", table) if c["column_name"] in columns]
@@ -548,15 +725,18 @@ def table_copy_delta_only(
     ]
     
     if progress_callback:
-        progress_callback(f"Found {len(new_rows)} new rows to copy...")
+        progress_callback(f"Found {len(new_rows)} new rows out of {len(src_rows)} total...")
     
     # Insert new rows
-    inserted = insert_rows(dst, table, new_rows, progress_callback)
+    if new_rows:
+        inserted = insert_rows(dst, table, new_rows, progress_callback)
+        if progress_callback:
+            progress_callback(f"✓ Completed: {inserted} new rows copied")
+    else:
+        if progress_callback:
+            progress_callback(f"✓ Completed: No new rows to copy (up to date)")
     
-    if progress_callback:
-        progress_callback(f"✓ Completed: {inserted} new rows copied")
-    
-    return inserted
+    return len(new_rows)
 
 
 def test_connection(cfg: DBConfig) -> tuple[bool, str]:
