@@ -160,14 +160,27 @@ def fetch_indexes(engine: Engine, schema: str, table: str) -> List[Dict]:
 
 
 def is_auto_generated_column(col: Dict) -> bool:
-    """Check if column is auto-generated (serial, sequence, or has default nextval)"""
+    """Check if column is auto-generated (serial, sequence, timestamps, or has default nextval)"""
+    col_name = col.get("column_name", "").lower()
     default = col.get("column_default", "")
+    data_type = col.get("data_type", "").lower()
+    
+    # Check common auto-generated column names
+    auto_gen_names = ["id", "created_at", "updated_at", "created_on", "updated_on", "timestamp"]
+    if col_name in auto_gen_names:
+        return True
+    
+    # Check if column name ends with _id (likely a primary key)
+    if col_name.endswith("_id") and ("nextval" in str(default).lower() or "serial" in data_type):
+        return True
+    
+    # Check for default values that indicate auto-generation
     if default:
         default = default.lower()
-        if "nextval" in default or "uuid_generate" in default:
+        if "nextval" in default or "uuid_generate" in default or "now()" in default or "current_timestamp" in default:
             return True
     
-    data_type = col.get("data_type", "").lower()
+    # Check for serial types
     if "serial" in data_type:
         return True
     

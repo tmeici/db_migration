@@ -2,9 +2,9 @@
 from textual.app import App, ComposeResult
 from textual.widgets import (
     Header, Footer, Button, Static, Input, 
-    DataTable, Select, Checkbox, Label, Log
+    DataTable, Select, Checkbox, Label, Log, ListView, ListItem
 )
-from textual.containers import Vertical, Horizontal, Container
+from textual.containers import Vertical, Horizontal, Container, ScrollableContainer
 from textual.screen import Screen
 from textual.binding import Binding
 
@@ -220,23 +220,30 @@ class DestDBScreen(Screen):
 
 
 class TableSelectionScreen(Screen):
-    """Screen for selecting tables in advanced mode"""
+    """Screen for selecting tables in advanced mode using checkboxes"""
     
     BINDINGS = [
         Binding("escape", "back", "Back"),
+        Binding("a", "select_all", "Select All"),
+        Binding("d", "deselect_all", "Deselect All"),
     ]
+    
+    def __init__(self):
+        super().__init__()
+        self.table_checkboxes = {}
     
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Container(
+        yield ScrollableContainer(
             Static("📋 SELECT TABLES TO MIGRATE", classes="section-title"),
             Static(""),
             Static("Available tables in source database:", classes="subtitle"),
-            DataTable(id="tables", zebra_stripes=True),
+            Static("💡 Use checkboxes to select tables. Press 'A' to select all, 'D' to deselect all.", classes="info"),
+            Static("", id="table-list"),
             Static(""),
             Horizontal(
-                Button("Select All", id="select_all", variant="default"),
-                Button("Deselect All", id="deselect_all", variant="default"),
+                Button("Select All (A)", id="select_all", variant="default"),
+                Button("Deselect All (D)", id="deselect_all", variant="default"),
                 classes="button-row"
             ),
             Static(""),
@@ -250,10 +257,8 @@ class TableSelectionScreen(Screen):
                 value="delete_recreate"
             ),
             Static(""),
-            Horizontal(
-                Checkbox("Exclude auto-generated columns (e.g., serial IDs)", id="exclude_auto"),
-                classes="checkbox-row"
-            ),
+            Static("Options:", classes="subtitle"),
+            Checkbox("Exclude auto-generated columns (id, serial, created_at, updated_at, etc.)", id="exclude_auto", value=True),
             Static(""),
             Horizontal(
                 Button("← Back", id="back", variant="default"),
@@ -261,7 +266,7 @@ class TableSelectionScreen(Screen):
                 classes="button-row"
             ),
             Static("", id="status"),
-            classes="form-container"
+            classes="form-container-scrollable"
         )
         yield Footer()
     
@@ -273,11 +278,20 @@ class TableSelectionScreen(Screen):
             src_engine = create_engine_safe(self.app.src_cfg)
             tables = fetch_tables(src_engine, "public")
             
-            table_widget = self.query_one("#tables", DataTable)
-            table_widget.add_columns("Selected", "Table Name")
+            # Create container for checkboxes
+            table_list = self.query_one("#table-list", Static)
+            
+            # Build checkbox list as a string (workaround for dynamic widgets)
+            checkbox_container = Container(id="checkbox-container")
             
             for table in tables:
-                table_widget.add_row("☐", table)
+                cb = Checkbox(table, id=f"table_{table}")
+                self.table_checkboxes[table] = cb
+                checkbox_container.mount(cb)
+            
+            # Mount the container
+            table_list.update("")
+            self.query_one(ScrollableContainer).mount(checkbox_container, before=self.query_one("#status"))
             
         except Exception as e:
             self.query_one("#status", Static).update(f"❌ Error loading tables: {str(e)}")
@@ -285,40 +299,33 @@ class TableSelectionScreen(Screen):
     def action_back(self):
         self.app.pop_screen()
     
+    def action_select_all(self):
+        """Select all tables"""
+        for checkbox in self.table_checkboxes.values():
+            checkbox.value = True
+    
+    def action_deselect_all(self):
+        """Deselect all tables"""
+        for checkbox in self.table_checkboxes.values():
+            checkbox.value = False
+    
     def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "back":
             self.app.pop_screen()
         elif event.button.id == "select_all":
-            self.select_all_tables(True)
+            self.action_select_all()
         elif event.button.id == "deselect_all":
-            self.select_all_tables(False)
+            self.action_deselect_all()
         elif event.button.id == "next":
             self.save_and_next()
     
-    def on_data_table_row_selected(self, event):
-        """Toggle selection when row is clicked"""
-        table_widget = self.query_one("#tables", DataTable)
-        row_key = event.row_key
-        current_value = table_widget.get_cell(row_key, "Selected")
-        new_value = "☑" if current_value == "☐" else "☐"
-        table_widget.update_cell(row_key, "Selected", new_value)
-    
-    def select_all_tables(self, select: bool):
-        table_widget = self.query_one("#tables", DataTable)
-        value = "☑" if select else "☐"
-        
-        for row_key in table_widget.rows:
-            table_widget.update_cell(row_key, "Selected", value)
-    
     def save_and_next(self):
-        # Get selected tables
-        table_widget = self.query_one("#tables", DataTable)
-        selected = []
-        
-        for row_key in table_widget.rows:
-            if table_widget.get_cell(row_key, "Selected") == "☑":
-                table_name = table_widget.get_cell(row_key, "Table Name")
-                selected.append(table_name)
+        # Get selected tables from checkboxes
+        selected = [
+            table_name 
+            for table_name, checkbox in self.table_checkboxes.items() 
+            if checkbox.value
+        ]
         
         if not selected:
             self.query_one("#status", Static).update("❌ Please select at least one table")
@@ -378,9 +385,11 @@ class ConfirmScreen(Screen):
         elif self.app.mode == "delta":
             return Static("  • Only new rows will be synchronized")
         elif self.app.mode == "advanced":
-            tables_text = f"{len(self.app.selected_tables)} table(s) selected"
+            tables_text = f"{len(self.app.selected_tables)} table(s) selected: {', '.join(self.app.selected_tables[:3])}"
+            if len(self.app.selected_tables) > 3:
+                tables_text += f" ... and {len(self.app.selected_tables) - 3} more"
             mode_text = "Delete & Recreate" if self.app.copy_mode == "delete_recreate" else "Delta Only"
-            auto_text = "Yes" if self.app.exclude_auto else "No"
+            auto_text = "Yes (id, created_at, updated_at will be excluded)" if self.app.exclude_auto else "No"
             return Static(f"  • {tables_text}\n  • Copy mode: {mode_text}\n  • Exclude auto-generated: {auto_text}")
         return Static("")
     
@@ -437,6 +446,8 @@ class ProgressScreen(Screen):
                 
             elif self.app.mode == "advanced":
                 log_progress("Starting table-level operations...")
+                log_progress(f"Exclude auto-generated: {self.app.exclude_auto}")
+                log_progress(f"Copy mode: {self.app.copy_mode}")
                 
                 for idx, table in enumerate(self.app.selected_tables, 1):
                     log_progress(f"\n[{idx}/{len(self.app.selected_tables)}] Processing: {table}")
@@ -484,8 +495,24 @@ class MigrationApp(App):
         align: center middle;
     }
     
-    .welcome-container, .form-container, .progress-container {
+    .welcome-container, .form-container {
         width: 80;
+        height: auto;
+        border: solid $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    
+    .form-container-scrollable {
+        width: 90;
+        height: 40;
+        border: solid $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    
+    .progress-container {
+        width: 90;
         height: auto;
         border: solid $primary;
         padding: 1 2;
@@ -513,7 +540,9 @@ class MigrationApp(App):
     
     .info {
         color: $text-muted;
-        margin: 0 2;
+        margin: 0 0 1 0;
+        text-align: center;
+        text-style: italic;
     }
     
     .warning {
@@ -540,7 +569,11 @@ class MigrationApp(App):
         align: center middle;
     }
     
-    .checkbox-row {
+    Checkbox {
+        margin: 0 0 1 0;
+    }
+    
+    #checkbox-container {
         height: auto;
         margin: 1 0;
     }
@@ -560,6 +593,10 @@ class MigrationApp(App):
         text-align: center;
         margin: 1 0;
     }
+    
+    Select {
+        margin: 1 0;
+    }
     """
     
     BINDINGS = [
@@ -573,7 +610,7 @@ class MigrationApp(App):
         self.dst_cfg = None
         self.selected_tables = []
         self.copy_mode = "delete_recreate"
-        self.exclude_auto = False
+        self.exclude_auto = True  # Default to TRUE - exclude auto-generated fields
     
     def on_mount(self):
         self.push_screen(WelcomeScreen())
