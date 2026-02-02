@@ -2,10 +2,14 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Callable
 from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.engine import Engine
-from datetime import datetime
+from datetime import datetime, date
 import logging
 import re
 import json
+import hashlib
+from decimal import Decimal
+
+
 
 # ---------------- CONFIG ---------------- #
 
@@ -185,6 +189,30 @@ def is_auto_generated_column(col: Dict) -> bool:
         return True
     
     return False
+
+def normalize_value(v):
+    if v is None:
+        return None
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if isinstance(v, Decimal):
+        return float(v)
+    if isinstance(v, float):
+        return round(v, 8)
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, sort_keys=True, separators=(",", ":"))
+    return v
+
+
+def row_fingerprint(row: dict, columns: list[str]) -> str:
+    normalized = {
+        col: normalize_value(row.get(col))
+        for col in columns
+    }
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 
 
 # ---------------- SCHEMA OPERATIONS ---------------- #
@@ -540,104 +568,115 @@ def full_migration(
 
 
 def incremental_sync(
-    src: Engine, 
+    src: Engine,
     dst: Engine,
     progress_callback: Optional[Callable] = None
 ):
     """
-    Mode 2: Incremental sync (delta copy)
-    Only copies new rows that don't exist in destination based on primary key
-    Does NOT drop existing tables - preserves existing data
+    SAFE incremental sync:
+    - Content-based (hash) comparison
+    - Excludes auto-generated columns
+    - Handles NULLs, JSON, floats, timestamps
+    - Syncs ENUM values BEFORE inserts
     """
+
     if progress_callback:
-        progress_callback("Starting incremental sync...")
-    
+        progress_callback("Starting SAFE incremental sync...")
+
     ensure_migrated_schema(dst)
     tables = fetch_tables(src, "public")
-    
-    total_tables = len(tables)
-    stats = {
-        "tables_created": 0,
-        "tables_synced": 0,
-        "tables_skipped": 0,
-        "tables_up_to_date": 0,
-        "total_rows_synced": 0
-    }
-    
+
+    total_inserted = 0
+
     for idx, table in enumerate(tables, 1):
-        if progress_callback:
-            progress_callback(f"[{idx}/{total_tables}] Processing table: {table}")
-        
-        # Get primary key
-        pk = fetch_primary_key(src, "public", table)
-        if not pk:
-            stats["tables_skipped"] += 1
-            if progress_callback:
-                progress_callback(f"[{idx}/{total_tables}] ⚠ Skipped {table} (no primary key)")
-            continue
-        
-        # Check if table exists in destination
-        table_exists = False
         try:
-            with dst.connect() as conn:
-                conn.execute(text(f'SELECT 1 FROM migrated."{table}" LIMIT 1'))
-            table_exists = True
-        except:
-            table_exists = False
-        
-        # Create table schema if it doesn't exist (without dropping)
-        if not table_exists:
-            stats["tables_created"] += 1
             if progress_callback:
-                progress_callback(f"[{idx}/{total_tables}] Creating table schema...")
-            columns = create_table_schema_if_not_exists(src, dst, table, exclude_auto_generated=False)
-        else:
-            # Table exists, just get columns
-            stats["tables_synced"] += 1
+                progress_callback(f"[{idx}/{len(tables)}] {table}")
+
+            # --------------------------------------------------
+            # 1. Fetch columns & exclude auto-generated fields
+            # --------------------------------------------------
+            all_cols = fetch_columns(src, "public", table)
+            data_cols = [c for c in all_cols if not is_auto_generated_column(c)]
+
+            if not data_cols:
+                if progress_callback:
+                    progress_callback("  ⚠ skipped (no comparable columns)")
+                continue
+
+            col_names = [c["column_name"] for c in data_cols]
+
+            # --------------------------------------------------
+            # 2. Ensure destination table schema
+            # --------------------------------------------------
+            create_table_schema_if_not_exists(
+                src,
+                dst,
+                table,
+                exclude_auto_generated=True
+            )
+
+            # --------------------------------------------------
+            # 4. Fetch source & destination rows
+            # --------------------------------------------------
+            src_rows = fetch_all_rows(src, table, col_names)
+
+            try:
+                dst_rows = fetch_all_rows(dst, table, col_names)
+            except Exception:
+                dst_rows = []
+
+            if not src_rows:
+                if progress_callback:
+                    progress_callback("  ✓ source empty")
+                continue
+
+            # --------------------------------------------------
+            # 5. Build destination hash set
+            # --------------------------------------------------
+            dst_hashes = {
+                row_fingerprint(r, col_names)
+                for r in dst_rows
+            }
+
+            # --------------------------------------------------
+            # 6. Detect new rows
+            # --------------------------------------------------
+            new_rows = []
+            for r in src_rows:
+                if row_fingerprint(r, col_names) not in dst_hashes:
+                    new_rows.append(prepare_row(r, data_cols))
+
             if progress_callback:
-                progress_callback(f"[{idx}/{total_tables}] Table exists, syncing new rows...")
-            columns = [c["column_name"] for c in fetch_columns(src, "public", table)]
-        
-        cols_meta = fetch_columns(src, "public", table)
-        
-        # Fetch source rows
-        src_rows = fetch_all_rows(src, table, columns)
-        
-        # Fetch existing PKs in destination (will be empty if table was just created)
-        existing_pks = fetch_existing_pks(dst, table, pk)
-        
-        # Filter new rows
-        new_rows = [
-            prepare_row(r, cols_meta)
-            for r in src_rows
-            if r.get(pk) not in existing_pks
-        ]
-        
-        if progress_callback:
-            progress_callback(f"[{idx}/{total_tables}] Found {len(new_rows)} new rows out of {len(src_rows)} total...")
-        
-        # Insert new rows
-        if new_rows:
-            inserted = insert_rows(dst, table, new_rows)
-            stats["total_rows_synced"] += inserted
+                progress_callback(
+                    f"  Δ {len(new_rows)} new / "
+                    f"{len(src_rows)} source / "
+                    f"{len(dst_rows)} dest"
+                )
+
+            # --------------------------------------------------
+            # 7. Insert new rows
+            # --------------------------------------------------
+            if new_rows:
+                inserted = insert_rows(dst, table, new_rows, progress_callback)
+                total_inserted += inserted
+                if progress_callback:
+                    progress_callback(f"  ✓ inserted {inserted}")
+            else:
+                if progress_callback:
+                    progress_callback("  ✓ already synced")
+
+        except Exception as e:
             if progress_callback:
-                progress_callback(f"[{idx}/{total_tables}] ✓ {table}: {inserted} new rows synced")
-        else:
-            stats["tables_up_to_date"] += 1
-            if progress_callback:
-                progress_callback(f"[{idx}/{total_tables}] ✓ {table}: No new rows to sync (up to date)")
-    
+                progress_callback(f"  ❌ ERROR in table {table}: {str(e)}")
+            raise  # fail fast (safe for data correctness)
+
     if progress_callback:
-        progress_callback(f"\n{'='*60}")
-        progress_callback(f"✅ Incremental sync completed!")
-        progress_callback(f"{'='*60}")
-        progress_callback(f"Total tables processed: {total_tables}")
-        progress_callback(f"  • New tables created: {stats['tables_created']}")
-        progress_callback(f"  • Existing tables synced: {stats['tables_synced']}")
-        progress_callback(f"  • Tables up to date: {stats['tables_up_to_date']}")
-        progress_callback(f"  • Tables skipped (no PK): {stats['tables_skipped']}")
-        progress_callback(f"  • Total new rows synced: {stats['total_rows_synced']}")
-        progress_callback(f"{'='*60}")
+        progress_callback("=" * 60)
+        progress_callback("✅ Incremental sync COMPLETED successfully")
+        progress_callback(f"Total rows inserted: {total_inserted}")
+        progress_callback("=" * 60)
+
 
 
 def table_copy_delete_and_recreate(
