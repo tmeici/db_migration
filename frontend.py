@@ -1,25 +1,28 @@
-# frontend.py
+"""
+Textual-based Terminal UI for PostgreSQL Migration Tool
+"""
 from textual.app import App, ComposeResult
 from textual.widgets import (
     Header, Footer, Button, Static, Input, 
-    DataTable, Select, Checkbox, Label, Log, ListView, ListItem
+    Select, Checkbox, Label, Log, ListView, ListItem
 )
 from textual.containers import Vertical, Horizontal, Container, ScrollableContainer
 from textual.screen import Screen
 from textual.binding import Binding
+import logging
 
-from backend import (
-    DBConfig,
-    create_engine_safe,
+from config import DBConfig, MigrationConfig
+from database import create_engine_safe, fetch_tables, test_connection
+from migrations import (
     full_migration,
     incremental_sync,
     table_copy_delete_and_recreate,
     table_copy_delta_only,
-    fetch_tables,
-    test_connection,
 )
+from report_generator import MigrationReportGenerator
 
-# ---------------- SCREENS ----------------
+logger = logging.getLogger(__name__)
+
 
 class WelcomeScreen(Screen):
     """Welcome screen with migration mode selection"""
@@ -31,21 +34,26 @@ class WelcomeScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Container(
-            Static("🗄️ PostgreSQL Migration Tool", classes="title"),
-            Static("Select your migration mode:", classes="subtitle"),
+            Static("🗄️ PostgreSQL Migration Tool v2.0", classes="title"),
+            Static("Production-Ready Database Migration", classes="subtitle"),
             Static(""),
             Button("📦 Full Database Copy", id="full", variant="primary"),
-            Static("  • Copies all tables and data to destination.migrated schema"),
             Static("  • Complete database replication"),
+            Static("  • Drops and recreates all tables"),
             Static(""),
-            Button("🔄 Incremental Sync (Delta)", id="delta", variant="success"),
-            Static("  • Copies only new rows based on primary key"),
-            Static("  • Efficient for ongoing synchronization"),
+            Button("🔄 Incremental Sync (Smart Delta)", id="delta", variant="success"),
+            Static("  • Hash-based content comparison"),
+            Static("  • Only copies new/changed data"),
+            Static("  • Preserves existing data"),
             Static(""),
             Button("📋 Table-Level Operations", id="advanced", variant="warning"),
-            Static("  • Select specific tables to migrate"),
-            Static("  • Choose copy mode per table"),
-            Static("  • Exclude auto-generated fields option"),
+            Static("  • Select specific tables"),
+            Static("  • Choose per-table copy mode"),
+            Static("  • Fine-grained control"),
+            Static(""),
+            Button("📊 Generate Reports", id="reports", variant="default"),
+            Static("  • View migration history"),
+            Static("  • Export to PDF/Excel"),
             Static(""),
             Button("❌ Exit", id="exit", variant="error"),
             classes="welcome-container"
@@ -55,6 +63,8 @@ class WelcomeScreen(Screen):
     def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "exit":
             self.app.exit()
+        elif event.button.id == "reports":
+            self.app.push_screen(ReportGenerationScreen())
         else:
             self.app.mode = event.button.id
             self.app.push_screen(SourceDBScreen())
@@ -220,7 +230,7 @@ class DestDBScreen(Screen):
 
 
 class TableSelectionScreen(Screen):
-    """Screen for selecting tables in advanced mode using checkboxes"""
+    """Screen for selecting tables in advanced mode"""
     
     BINDINGS = [
         Binding("escape", "back", "Back"),
@@ -254,7 +264,7 @@ class TableSelectionScreen(Screen):
                     ("Delta Only (Add new rows)", "delta_only"),
                 ],
                 id="copy_mode",
-                value="delete_recreate"
+                value="delta_only"
             ),
             Static(""),
             Static("Options:", classes="subtitle"),
@@ -281,7 +291,7 @@ class TableSelectionScreen(Screen):
             # Create container for checkboxes
             table_list = self.query_one("#table-list", Static)
             
-            # Build checkbox list as a string (workaround for dynamic widgets)
+            # Build checkbox list
             checkbox_container = Container(id="checkbox-container")
             
             for table in tables:
@@ -293,6 +303,7 @@ class TableSelectionScreen(Screen):
             table_list.update("")
             self.query_one(ScrollableContainer).mount(checkbox_container, before=self.query_one("#status"))
             
+            src_engine.dispose()
         except Exception as e:
             self.query_one("#status", Static).update(f"❌ Error loading tables: {str(e)}")
     
@@ -349,7 +360,7 @@ class ConfirmScreen(Screen):
     def compose(self) -> ComposeResult:
         mode_text = {
             "full": "Full Database Copy",
-            "delta": "Incremental Sync (Delta)",
+            "delta": "Incremental Sync (Smart Delta)",
             "advanced": "Table-Level Operations"
         }
         
@@ -367,7 +378,7 @@ class ConfirmScreen(Screen):
             Static("⚠️  IMPORTANT:", classes="warning"),
             Static("  • Tables will be created in 'migrated' schema"),
             Static("  • Original 'public' schema will NOT be modified"),
-            Static("  • This operation cannot be undone"),
+            Static("  • All operations are tracked for reporting"),
             Static(""),
             Horizontal(
                 Button("← Back", id="back", variant="default"),
@@ -381,15 +392,15 @@ class ConfirmScreen(Screen):
     
     def _get_mode_specific_info(self) -> Static:
         if self.app.mode == "full":
-            return Static("  • All tables will be copied")
+            return Static("  • All tables will be dropped and recreated")
         elif self.app.mode == "delta":
-            return Static("  • Only new rows will be synchronized")
+            return Static("  • Only new/changed rows will be synchronized\n  • Existing data preserved")
         elif self.app.mode == "advanced":
             tables_text = f"{len(self.app.selected_tables)} table(s) selected: {', '.join(self.app.selected_tables[:3])}"
             if len(self.app.selected_tables) > 3:
                 tables_text += f" ... and {len(self.app.selected_tables) - 3} more"
             mode_text = "Delete & Recreate" if self.app.copy_mode == "delete_recreate" else "Delta Only"
-            auto_text = "Yes (id, created_at, updated_at will be excluded)" if self.app.exclude_auto else "No"
+            auto_text = "Yes" if self.app.exclude_auto else "No"
             return Static(f"  • {tables_text}\n  • Copy mode: {mode_text}\n  • Exclude auto-generated: {auto_text}")
         return Static("")
     
@@ -417,7 +428,7 @@ class ProgressScreen(Screen):
             Static(""),
             Static("⏳ Please wait...", id="status"),
             Static(""),
-            Button("View Details", id="toggle_log", variant="default"),
+            Button("Close", id="close", variant="default", disabled=True),
             classes="progress-container"
         )
         yield Footer()
@@ -436,13 +447,24 @@ class ProgressScreen(Screen):
             src_engine = create_engine_safe(self.app.src_cfg)
             dst_engine = create_engine_safe(self.app.dst_cfg)
             
+            config = MigrationConfig()
+            
             if self.app.mode == "full":
                 log_progress("Starting full database copy...")
-                full_migration(src_engine, dst_engine, exclude_auto_generated=False, progress_callback=log_progress)
+                full_migration(
+                    src_engine, dst_engine,
+                    exclude_auto_generated=False,
+                    config=config,
+                    progress_callback=log_progress
+                )
                 
             elif self.app.mode == "delta":
                 log_progress("Starting incremental sync...")
-                incremental_sync(src_engine, dst_engine, log_progress)
+                incremental_sync(
+                    src_engine, dst_engine,
+                    config=config,
+                    progress_callback=log_progress
+                )
                 
             elif self.app.mode == "advanced":
                 log_progress("Starting table-level operations...")
@@ -458,6 +480,7 @@ class ProgressScreen(Screen):
                             dst_engine, 
                             table,
                             exclude_auto_generated=self.app.exclude_auto,
+                            config=config,
                             progress_callback=log_progress
                         )
                     else:  # delta_only
@@ -466,29 +489,126 @@ class ProgressScreen(Screen):
                             dst_engine,
                             table,
                             exclude_auto_generated=self.app.exclude_auto,
+                            config=config,
                             progress_callback=log_progress
                         )
                 
                 log_progress(f"\n✅ All {len(self.app.selected_tables)} tables processed successfully!")
             
             status.update("✅ Migration completed successfully!")
+            self.query_one("#close", Button).disabled = False
+            
+            # Cleanup
+            src_engine.dispose()
+            dst_engine.dispose()
             
         except Exception as e:
             log_progress(f"\n❌ ERROR: {str(e)}")
             import traceback
             log_progress(traceback.format_exc())
             status.update("❌ Migration failed!")
+            self.query_one("#close", Button).disabled = False
     
     def on_button_pressed(self, event: Button.Pressed):
-        if event.button.id == "toggle_log":
-            log = self.query_one("#log", Log)
-            log.display = not log.display
+        if event.button.id == "close":
+            self.app.pop_screen()
 
 
-# ---------------- MAIN APP ----------------
+class ReportGenerationScreen(Screen):
+    """Screen for generating migration reports"""
+    
+    BINDINGS = [
+        Binding("escape", "back", "Back"),
+    ]
+    
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Container(
+            Static("📊 REPORT GENERATION", classes="section-title"),
+            Static(""),
+            Static("Configure destination database to generate reports:", classes="subtitle"),
+            Static(""),
+            Label("Host:"),
+            Input(placeholder="localhost", id="host", value="localhost"),
+            Label("Port:"),
+            Input(placeholder="5432", id="port", value="5432"),
+            Label("Database:"),
+            Input(placeholder="dest_db", id="db"),
+            Label("User:"),
+            Input(placeholder="postgres", id="user", value="postgres"),
+            Label("Password:"),
+            Input(placeholder="password", password=True, id="pwd"),
+            Static(""),
+            Horizontal(
+                Button("Generate Excel Report", id="excel", variant="primary"),
+                Button("Generate PDF Report", id="pdf", variant="success"),
+                classes="button-row"
+            ),
+            Static(""),
+            Button("← Back", id="back", variant="default"),
+            Static("", id="status"),
+            classes="form-container"
+        )
+        yield Footer()
+    
+    def action_back(self):
+        self.app.pop_screen()
+    
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "back":
+            self.app.pop_screen()
+        elif event.button.id == "excel":
+            self.generate_excel()
+        elif event.button.id == "pdf":
+            self.generate_pdf()
+    
+    def get_config(self) -> DBConfig:
+        return DBConfig(
+            host=self.query_one("#host", Input).value,
+            port=self.query_one("#port", Input).value,
+            database=self.query_one("#db", Input).value,
+            user=self.query_one("#user", Input).value,
+            password=self.query_one("#pwd", Input).value,
+        )
+    
+    def generate_excel(self):
+        status = self.query_one("#status", Static)
+        status.update("Generating Excel report...")
+        
+        try:
+            cfg = self.get_config()
+            engine = create_engine_safe(cfg)
+            
+            reporter = MigrationReportGenerator(engine)
+            output_path = f"migration_report_{cfg.database}.xlsx"
+            reporter.generate_excel_report(output_path)
+            
+            status.update(f"✅ Excel report generated: {output_path}")
+            engine.dispose()
+        except Exception as e:
+            status.update(f"❌ Error: {str(e)}")
+    
+    def generate_pdf(self):
+        status = self.query_one("#status", Static)
+        status.update("Generating PDF report...")
+        
+        try:
+            cfg = self.get_config()
+            engine = create_engine_safe(cfg)
+            
+            reporter = MigrationReportGenerator(engine)
+            output_path = f"migration_report_{cfg.database}.pdf"
+            reporter.generate_pdf_report(output_path)
+            
+            status.update(f"✅ PDF report generated: {output_path}")
+            engine.dispose()
+        except Exception as e:
+            status.update(f"❌ Error: {str(e)}")
 
+
+# Main Application
 class MigrationApp(App):
-    """PostgreSQL Migration Tool"""
+    """PostgreSQL Migration Tool v2.0"""
     
     CSS = """
     Screen {
@@ -578,13 +698,8 @@ class MigrationApp(App):
         margin: 1 0;
     }
     
-    DataTable {
-        height: 15;
-        margin: 1 0;
-    }
-    
     Log {
-        height: 20;
+        height: 25;
         border: solid $primary;
         margin: 1 0;
     }
@@ -609,8 +724,8 @@ class MigrationApp(App):
         self.src_cfg = None
         self.dst_cfg = None
         self.selected_tables = []
-        self.copy_mode = "delete_recreate"
-        self.exclude_auto = True  # Default to TRUE - exclude auto-generated fields
+        self.copy_mode = "delta_only"  # Default to delta_only for safety
+        self.exclude_auto = True
     
     def on_mount(self):
         self.push_screen(WelcomeScreen())
@@ -619,6 +734,15 @@ class MigrationApp(App):
         self.exit()
 
 
-if __name__ == "__main__":
+def run_ui():
+    """Run the Terminal UI"""
     app = MigrationApp()
     app.run()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    run_ui()
