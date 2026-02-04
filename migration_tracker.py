@@ -38,6 +38,7 @@ class MigrationTracker:
             status VARCHAR(50) NOT NULL,
             error_message TEXT,
             metadata JSONB,
+            target_schema VARCHAR(255),
             UNIQUE(table_name, source_db, started_at)
         )
         """
@@ -51,13 +52,14 @@ class MigrationTracker:
         source_db: str,
         source_host: str,
         migration_type: str,
+        target_schema: str = "migrated",
         metadata: Optional[Dict] = None
     ) -> int:
         """Record the start of a migration"""
         sql = f"""
         INSERT INTO {self.schema}._migration_metadata 
-        (table_name, source_db, source_host, migration_type, started_at, status, metadata)
-        VALUES (:table_name, :source_db, :source_host, :migration_type, :started_at, :status, :metadata)
+        (table_name, source_db, source_host, migration_type, started_at, status, metadata, target_schema)
+        VALUES (:table_name, :source_db, :source_host, :migration_type, :started_at, :status, :metadata, :target_schema)
         RETURNING id
         """
         
@@ -71,7 +73,8 @@ class MigrationTracker:
                     "migration_type": migration_type,
                     "started_at": datetime.now(),
                     "status": "in_progress",
-                    "metadata": json.dumps(metadata or {})
+                    "metadata": json.dumps(metadata or {}),
+                    "target_schema": target_schema
                 }
             )
             migration_id = result.scalar()

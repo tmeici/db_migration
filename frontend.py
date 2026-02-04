@@ -85,7 +85,7 @@ class SourceDBScreen(Screen):
             Label("Host:"),
             Input(placeholder="localhost", id="host", value="localhost"),
             Label("Port:"),
-            Input(placeholder="5432", id="port", value="5432"),
+            Input(placeholder="6000", id="port", value="6000"),
             Label("Database:"),
             Input(placeholder="source_db", id="db"),
             Label("User:"),
@@ -162,7 +162,7 @@ class DestDBScreen(Screen):
             Label("Host:"),
             Input(placeholder="localhost", id="host", value="localhost"),
             Label("Port:"),
-            Input(placeholder="5432", id="port", value="5432"),
+            Input(placeholder="6000", id="port", value="6000"),
             Label("Database:"),
             Input(placeholder="dest_db", id="db"),
             Label("User:"),
@@ -241,6 +241,7 @@ class TableSelectionScreen(Screen):
     def __init__(self):
         super().__init__()
         self.table_checkboxes = {}
+        self.tables = []
     
     def compose(self) -> ComposeResult:
         yield Header()
@@ -249,7 +250,8 @@ class TableSelectionScreen(Screen):
             Static(""),
             Static("Available tables in source database:", classes="subtitle"),
             Static("💡 Use checkboxes to select tables. Press 'A' to select all, 'D' to deselect all.", classes="info"),
-            Static("", id="table-list"),
+            Static(""),
+            Container(id="checkbox-container"),
             Static(""),
             Horizontal(
                 Button("Select All (A)", id="select_all", variant="default"),
@@ -260,8 +262,8 @@ class TableSelectionScreen(Screen):
             Static("Copy Mode:", classes="subtitle"),
             Select(
                 [
-                    ("Delete & Recreate (Full refresh)", "delete_recreate"),
                     ("Delta Only (Add new rows)", "delta_only"),
+                    ("Delete & Recreate (Full refresh)", "delete_recreate"),
                 ],
                 id="copy_mode",
                 value="delta_only"
@@ -285,27 +287,32 @@ class TableSelectionScreen(Screen):
     
     def load_tables(self):
         try:
+            status = self.query_one("#status", Static)
+            status.update("Loading tables...")
+            
             src_engine = create_engine_safe(self.app.src_cfg)
-            tables = fetch_tables(src_engine, "public")
+            self.tables = fetch_tables(src_engine, "public")
             
-            # Create container for checkboxes
-            table_list = self.query_one("#table-list", Static)
+            if not self.tables:
+                status.update("⚠️ No tables found in source database")
+                src_engine.dispose()
+                return
             
-            # Build checkbox list
-            checkbox_container = Container(id="checkbox-container")
+            # Get the checkbox container
+            container = self.query_one("#checkbox-container", Container)
             
-            for table in tables:
-                cb = Checkbox(table, id=f"table_{table}")
+            # Add checkboxes for each table
+            for table in self.tables:
+                cb = Checkbox(f"  {table}", id=f"table_{table}", value=False)
                 self.table_checkboxes[table] = cb
-                checkbox_container.mount(cb)
+                container.mount(cb)
             
-            # Mount the container
-            table_list.update("")
-            self.query_one(ScrollableContainer).mount(checkbox_container, before=self.query_one("#status"))
-            
+            status.update(f"✅ Loaded {len(self.tables)} tables")
             src_engine.dispose()
+            
         except Exception as e:
             self.query_one("#status", Static).update(f"❌ Error loading tables: {str(e)}")
+            logger.error(f"Error loading tables: {e}", exc_info=True)
     
     def action_back(self):
         self.app.pop_screen()
@@ -314,11 +321,13 @@ class TableSelectionScreen(Screen):
         """Select all tables"""
         for checkbox in self.table_checkboxes.values():
             checkbox.value = True
+        self.query_one("#status", Static).update(f"✅ Selected all {len(self.table_checkboxes)} tables")
     
     def action_deselect_all(self):
         """Deselect all tables"""
         for checkbox in self.table_checkboxes.values():
             checkbox.value = False
+        self.query_one("#status", Static).update("Deselected all tables")
     
     def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "back":
@@ -347,6 +356,7 @@ class TableSelectionScreen(Screen):
         self.app.copy_mode = self.query_one("#copy_mode", Select).value
         self.app.exclude_auto = self.query_one("#exclude_auto", Checkbox).value
         
+        self.query_one("#status", Static).update(f"✅ Selected {len(selected)} tables")
         self.app.push_screen(ConfirmScreen())
 
 
@@ -531,7 +541,7 @@ class ReportGenerationScreen(Screen):
             Label("Host:"),
             Input(placeholder="localhost", id="host", value="localhost"),
             Label("Port:"),
-            Input(placeholder="5432", id="port", value="5432"),
+            Input(placeholder="6000", id="port", value="6000"),
             Label("Database:"),
             Input(placeholder="dest_db", id="db"),
             Label("User:"),
@@ -579,11 +589,12 @@ class ReportGenerationScreen(Screen):
             cfg = self.get_config()
             engine = create_engine_safe(cfg)
             
-            reporter = MigrationReportGenerator(engine)
-            output_path = f"migration_report_{cfg.database}.xlsx"
-            reporter.generate_excel_report(output_path)
+            # Auto-detect schema (will raise error with helpful message if multiple found)
+            reporter = MigrationReportGenerator(engine, target_schema="migrated")
+            output_path = f"migration_report_{cfg.database}_{reporter.target_schema}.xlsx"
+            final_path = reporter.generate_excel_report(output_path)
             
-            status.update(f"✅ Excel report generated: {output_path}")
+            status.update(f"✅ Excel report generated: {final_path}")
             engine.dispose()
         except Exception as e:
             status.update(f"❌ Error: {str(e)}")
@@ -596,11 +607,12 @@ class ReportGenerationScreen(Screen):
             cfg = self.get_config()
             engine = create_engine_safe(cfg)
             
-            reporter = MigrationReportGenerator(engine)
-            output_path = f"migration_report_{cfg.database}.pdf"
-            reporter.generate_pdf_report(output_path)
+            # Auto-detect schema (will raise error with helpful message if multiple found)
+            reporter = MigrationReportGenerator(engine, target_schema="migrated")
+            output_path = f"migration_report_{cfg.database}_{reporter.target_schema}.pdf"
+            final_path = reporter.generate_pdf_report(output_path)
             
-            status.update(f"✅ PDF report generated: {output_path}")
+            status.update(f"✅ PDF report generated: {final_path}")
             engine.dispose()
         except Exception as e:
             status.update(f"❌ Error: {str(e)}")

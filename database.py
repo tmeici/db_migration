@@ -166,3 +166,15 @@ def ensure_schema(engine: Engine, schema: str):
     with engine.begin() as conn:
         conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
     logger.info(f"Schema '{schema}' ensured")
+
+
+def get_row_count(engine: Engine, table: str, schema: str = "public") -> int:
+    """Get total row count for a table"""
+    sql = f'SELECT COUNT(*) FROM {schema}."{table}"'
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text(sql))
+            return result.scalar()
+    except Exception as e:
+        logger.debug(f"Could not get row count for {schema}.{table}: {str(e)}")
+        return 0
