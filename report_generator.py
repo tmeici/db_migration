@@ -5,6 +5,7 @@ FIXED: Better error handling and schema detection
 import os
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional
 import pandas as pd
 from reportlab.lib import colors
@@ -249,9 +250,10 @@ class MigrationReportGenerator:
         title = Paragraph("PostgreSQL Migration Report", title_style)
         story.append(title)
         
+        ist_time = datetime.now(ZoneInfo("Asia/Kolkata"))
         # Report metadata
         metadata_text = (
-            f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br/>"
+            f"<b>Generated:</b> {ist_time.strftime('%Y-%m-%d %H:%M:%S')}<br/>"
             f"<b>Destination Database:</b> {self.engine.url.database}<br/>"
             f"<b>Target Schema:</b> {self.target_schema}<br/>"
         )
@@ -281,7 +283,7 @@ class MigrationReportGenerator:
             
             summary_table = Table(summary_data, colWidths=[3*inch, 3*inch])
             summary_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3498DB')),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#AC20B9')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
@@ -310,7 +312,7 @@ class MigrationReportGenerator:
             
             migrations_table = Table(migration_data, colWidths=[1.5*inch, 1.3*inch, 0.8*inch, 1*inch, 1.4*inch])
             migrations_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3498DB')),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#AC20B9")),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
@@ -362,7 +364,7 @@ class MigrationReportGenerator:
             
             state_table = Table(state_data, colWidths=[2*inch, 1.5*inch, 1.5*inch, 1.5*inch])
             state_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3498DB')),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#AC20B9")),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
