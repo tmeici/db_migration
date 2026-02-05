@@ -485,5 +485,91 @@ def metrics():
                 click.echo(f"{m['migration_id']}: {m['status']} | {m['duration']} | {m['rows']} rows")
 
 
-if __name__ == '__main__':
-    cli()
+@cli.command(name='dry-run')
+@click.option('--src-host', required=True, help='Source database host')
+@click.option('--src-port', default='6000', help='Source database port')
+@click.option('--src-db', required=True, help='Source database name')
+@click.option('--src-user', required=True, help='Source database user')
+@click.option('--src-password', required=True, help='Source database password')
+@click.option('--dst-host', required=True, help='Destination database host')
+@click.option('--dst-port', default='6000', help='Destination database port')
+@click.option('--dst-db', required=True, help='Destination database name')
+@click.option('--dst-user', required=True, help='Database user')
+@click.option('--dst-password', required=True, help='Database password')
+@click.option('--src-schema', default='public', help='Source schema name')
+@click.option('--dst-schema', default='migrated', help='Destination schema name')
+@click.option('--migration-type', type=click.Choice(['full', 'incremental']), 
+              default='full', help='Type of migration to simulate')
+@click.option('--exclude-auto/--include-auto', default=False, 
+              help='Exclude auto-generated columns (full migration only)')
+@click.option('--detailed/--summary', default=True, help='Show detailed analysis')
+@click.option('--output', '-o', help='Save report to file')
+def dry_run(src_host, src_port, src_db, src_user, src_password,
+            dst_host, dst_port, dst_db, dst_user, dst_password,
+            src_schema, dst_schema, migration_type, exclude_auto, detailed, output):
+    """
+    Simulate migration without executing (Feature #2: Dry Run Visualization)
+    
+    Analyzes what will happen during migration including:
+    - Tables affected and execution order
+    - Row counts and data size estimates
+    - Performance estimates (duration, memory, disk)
+    - Risk assessment and warnings
+    - Dependency analysis
+    """
+    from dry_run_analyzer import DryRunAnalyzer
+    from dry_run_visualizer import DryRunVisualizer
+    
+    src_cfg = DBConfig(src_host, src_port, src_db, src_user, src_password)
+    dst_cfg = DBConfig(dst_host, dst_port, dst_db, dst_user, dst_password)
+    
+    # Test connections
+    click.echo("Testing connections...")
+    for name, cfg in [("Source", src_cfg), ("Destination", dst_cfg)]:
+        success, msg = test_connection(cfg)
+        if not success:
+            click.echo(f"✗ {name} connection failed: {msg}", err=True)
+            return
+        click.echo(f"✓ {name} connection successful")
+    
+    click.echo(f"\nAnalyzing {migration_type} migration...")
+    click.echo(f"Source: {src_db}.{src_schema} → Destination: {dst_db}.{dst_schema}")
+    
+    src_engine = create_engine_safe(src_cfg)
+    dst_engine = create_engine_safe(dst_cfg)
+    
+    try:
+        analyzer = DryRunAnalyzer(src_engine, dst_engine, src_schema, dst_schema)
+        
+        # Perform analysis
+        if migration_type == 'full':
+            result = analyzer.analyze_full_migration(exclude_auto_generated=exclude_auto)
+        else:
+            result = analyzer.analyze_incremental_sync()
+        
+        # Generate report
+        report = DryRunVisualizer.format_dry_run_report(result, detailed=detailed)
+        
+        # Display report
+        click.echo("\n" + report)
+        
+        # Save to file if requested
+        if output:
+            with open(output, 'w') as f:
+                f.write(report)
+            click.echo(f"\n✓ Report saved to: {output}")
+        
+        # Exit code based on safety
+        if not result.is_safe_to_execute:
+            click.echo("\n⚠️  Review warnings before proceeding with migration!")
+            return 1
+        
+        return 0
+        
+    except Exception as e:
+        click.echo(f"\n✗ Dry run analysis failed: {str(e)}", err=True)
+        logger.error("Dry run error", exc_info=True)
+        return 1
+    finally:
+        src_engine.dispose()
+        dst_engine.dispose()

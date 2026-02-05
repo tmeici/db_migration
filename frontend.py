@@ -222,11 +222,8 @@ class DestDBScreen(Screen):
         
         self.app.dst_cfg = cfg
         
-        # Navigate based on mode
-        if self.app.mode == "advanced":
-            self.app.push_screen(TableSelectionScreen())
-        else:
-            self.app.push_screen(ConfirmScreen())
+        # Show dry run option screen
+        self.app.push_screen(DryRunOptionScreen())
 
 
 class TableSelectionScreen(Screen):
@@ -524,6 +521,161 @@ class ProgressScreen(Screen):
             self.app.pop_screen()
 
 
+
+
+class DryRunOptionScreen(Screen):
+    """Screen to offer dry run before migration"""
+    
+    BINDINGS = [
+        Binding("escape", "back", "Back"),
+    ]
+    
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Container(
+            Static("🔍 DRY RUN OPTION", classes="section-title"),
+            Static(""),
+            Static("Would you like to run a dry run analysis before proceeding?", classes="subtitle"),
+            Static(""),
+            Static("Dry run will show you:", classes="info"),
+            Static("  • Tables that will be affected"),
+            Static("  • Estimated row counts and data sizes"),
+            Static("  • Performance estimates (duration, memory)"),
+            Static("  • Risk assessment and warnings"),
+            Static("  • Dependency analysis"),
+            Static(""),
+            Horizontal(
+                Button("🔍 Run Dry Run", id="dry_run", variant="primary"),
+                Button("⏭️ Skip & Continue", id="skip", variant="warning"),
+                Button("← Back", id="back", variant="default"),
+                classes="button-row"
+            ),
+            Static("", id="status"),
+            classes="form-container"
+        )
+        yield Footer()
+    
+    def action_back(self):
+        self.app.pop_screen()
+    
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "back":
+            self.app.pop_screen()
+        elif event.button.id == "dry_run":
+            self.run_dry_run()
+        elif event.button.id == "skip":
+            self.skip_dry_run()
+    
+    def run_dry_run(self):
+        """Execute dry run analysis"""
+        from dry_run_analyzer import DryRunAnalyzer
+        from dry_run_visualizer import DryRunVisualizer
+        
+        status = self.query_one("#status", Static)
+        status.update("Running dry run analysis...")
+        
+        try:
+            src_engine = create_engine_safe(self.app.src_cfg)
+            dst_engine = create_engine_safe(self.app.dst_cfg)
+            
+            analyzer = DryRunAnalyzer(src_engine, dst_engine, "public", "migrated")
+            
+            # Determine migration type
+            if self.app.mode == "full":
+                result = analyzer.analyze_full_migration(exclude_auto_generated=self.app.exclude_auto)
+            else:
+                result = analyzer.analyze_incremental_sync()
+            
+            src_engine.dispose()
+            dst_engine.dispose()
+            
+            # Show dry run results
+            self.app.dry_run_result = result
+            self.app.push_screen(DryRunResultScreen())
+            
+        except Exception as e:
+            status.update(f"❌ Error: {str(e)}")
+            logger.error(f"Dry run error: {str(e)}")
+    
+    def skip_dry_run(self):
+        """Skip dry run and proceed to next screen"""
+        # Navigate based on mode
+        if self.app.mode == "advanced":
+            self.app.push_screen(TableSelectionScreen())
+        else:
+            self.app.push_screen(ConfirmScreen())
+
+
+class DryRunResultScreen(Screen):
+    """Display dry run analysis results"""
+    
+    BINDINGS = [
+        Binding("escape", "back", "Back"),
+    ]
+    
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield ScrollableContainer(
+            Static("🔍 DRY RUN ANALYSIS RESULTS", classes="section-title"),
+            Static("", id="report"),
+            Static(""),
+            Horizontal(
+                Button("✅ Proceed with Migration", id="proceed", variant="primary"),
+                Button("💾 Save Report", id="save", variant="default"),
+                Button("← Back", id="back", variant="warning"),
+                classes="button-row"
+            ),
+            Static("", id="status"),
+            classes="form-container-scrollable"
+        )
+        yield Footer()
+    
+    def on_mount(self):
+        """Populate the dry run report"""
+        from dry_run_visualizer import DryRunVisualizer
+        
+        result = self.app.dry_run_result
+        report = DryRunVisualizer.format_dry_run_report(result, detailed=True)
+        
+        self.query_one("#report", Static).update(report)
+    
+    def action_back(self):
+        self.app.pop_screen()
+    
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "back":
+            self.app.pop_screen()
+        elif event.button.id == "proceed":
+            # Navigate based on mode
+            if self.app.mode == "advanced":
+                self.app.push_screen(TableSelectionScreen())
+            else:
+                self.app.push_screen(ConfirmScreen())
+        elif event.button.id == "save":
+            self.save_report()
+    
+    def save_report(self):
+        """Save the dry run report to file"""
+        from dry_run_visualizer import DryRunVisualizer
+        import datetime
+        
+        status = self.query_one("#status", Static)
+        
+        try:
+            result = self.app.dry_run_result
+            report = DryRunVisualizer.format_dry_run_report(result, detailed=True)
+            
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"dry_run_report_{timestamp}.txt"
+            
+            with open(filename, 'w') as f:
+                f.write(report)
+            
+            status.update(f"✅ Report saved to: {filename}")
+        except Exception as e:
+            status.update(f"❌ Error saving report: {str(e)}")
+
+
 class ReportGenerationScreen(Screen):
     """Screen for generating migration reports"""
     
@@ -738,6 +890,9 @@ class MigrationApp(App):
         self.selected_tables = []
         self.copy_mode = "delta_only"  # Default to delta_only for safety
         self.exclude_auto = True
+        self.dry_run_result = None
+        self.rollback_scenario = None
+        self.rollback_simulator = None
     
     def on_mount(self):
         self.push_screen(WelcomeScreen())
